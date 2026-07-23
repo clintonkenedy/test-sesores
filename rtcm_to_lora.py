@@ -80,6 +80,18 @@ NMEA_START = ord("$")
 RTCM_CRC_LEN = 3
 
 
+def crc24q(data):
+    """CRC-24Q (polynomial 0x1864CFB), the checksum every RTCM3 frame ends with."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    return crc & 0xFFFFFF
+
+
 def show_ports():
     """List visible serial ports so the base's adapter can be identified."""
     ports = sorted(list_ports.comports())
@@ -108,8 +120,15 @@ def read_messages(stream):
             # the next preamble resynchronise us.
             if length < 2 or len(body) < length + RTCM_CRC_LEN:
                 continue
+            frame = lead + header + body
+            # A 0xD3 inside another message's payload frames as garbage here;
+            # the CRC unmasks it, so only pristine frames are ever forwarded.
+            expected = int.from_bytes(frame[-RTCM_CRC_LEN:], "big")
+            if crc24q(frame[:-RTCM_CRC_LEN]) != expected:
+                yield -1, frame
+                continue
             number = (body[0] << 4) | (body[1] >> 4)
-            yield number, lead + header + body
+            yield number, frame
 
         elif lead[0] == NMEA_START:
             sentence = stream.readline()
@@ -307,6 +326,9 @@ def main():
     parser.add_argument("--drop", type=int, nargs="*", default=sorted(DROP_MESSAGES),
                         metavar="MSG",
                         help="RTCM message numbers to discard (default: %(default)s)")
+    parser.add_argument("--raw", action="store_true",
+                        help="forward the stream byte-for-byte: no framing, no "
+                             "filter, no throttle (diagnostic)")
     parser.add_argument("--dry-run", action="store_true",
                         help="filter and report without transmitting")
     parser.add_argument("--stats-every", type=float, default=STATS_EVERY,
@@ -341,6 +363,41 @@ def main():
     started = time.monotonic()
     next_report = started + args.stats_every
 
+    # Raw passthrough: the exact bytes the base emits, untouched. If the rover
+    # fixes in this mode but not in filtered mode, the filtering is to blame.
+    if args.raw:
+        print("RAW passthrough - no framing, no filter, no throttle.")
+        total = 0
+        lost = 0
+        try:
+            with serial.Serial(args.port, args.baud, timeout=1) as stream:
+                while True:
+                    if link is not None:
+                        link.poll()
+                    data = stream.read(512)
+                    now = time.monotonic()
+                    if data:
+                        if link is None or link.send(data):
+                            total += len(data)
+                        else:
+                            lost += len(data)
+                    if now >= next_report:
+                        elapsed = now - started
+                        where = "  [{}]".format(link.status()) if link else ""
+                        print("--- {:.0f} s ---{}  raw {:.1f} B/s  lost {:.1f} B/s"
+                              .format(elapsed, where, total / elapsed,
+                                      lost / elapsed))
+                        next_report = now + args.stats_every
+        except serial.SerialException as error:
+            print("Could not open {}: {}".format(args.port, error))
+            print("Run with --list to see which ports exist.")
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        finally:
+            if link is not None:
+                link.close()
+        return
+
     try:
         with serial.Serial(args.port, args.baud, timeout=1) as stream:
             for number, frame in read_messages(stream):
@@ -350,6 +407,8 @@ def main():
 
                 if number is None:
                     dropped["NMEA"] += len(frame)
+                elif number == -1:
+                    dropped["RTCM bad-crc"] += len(frame)
                 elif number in drop:
                     dropped["RTCM {}".format(number)] += len(frame)
                 elif (number in THROTTLE_SECONDS
