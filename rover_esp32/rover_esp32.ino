@@ -27,11 +27,11 @@
 //  CONFIGURATION - edit these for your network and base machine.
 // ===========================================================================
 
-const char* WIFI_SSID = "your-wifi";
-const char* WIFI_PASS = "your-password";
+const char* WIFI_SSID = "Starlink";
+const char* WIFI_PASS = "starlinkmelvin";
 
 // The base PC running rtcm_to_lora.py in server mode. Find its IP with ipconfig.
-const char* BASE_HOST = "192.168.1.50";
+const char* BASE_HOST = "192.168.1.162";
 const uint16_t BASE_PORT = 8887;
 
 const uint32_t GNSS_BAUD = 115200;   // must match the LC29H
