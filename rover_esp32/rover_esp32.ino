@@ -45,6 +45,7 @@ const uint32_t RECONNECT_DELAY_MS = 3000;
 WiFiClient base;
 char nmeaLine[128];
 size_t nmeaLen = 0;
+float lastHSigma = -1.0f;   // last horizontal precision seen, metres
 
 const char* fixName(int quality) {
   switch (quality) {
@@ -77,23 +78,27 @@ bool nmeaField(const char* line, int n, char* out, size_t outSize) {
 }
 
 // GGA carries the fix: quality (field 6), satellites (7), correction age (13).
+// The summary goes to USB and back to the base over the same TCP link, so the
+// fix can be watched on the base PC with no computer at the rover.
 void reportGGA(const char* line) {
   char quality[8], sats[8], age[12];
   if (!nmeaField(line, 6, quality, sizeof(quality))) return;
+  nmeaField(line, 7, sats, sizeof(sats));
+  nmeaField(line, 13, age, sizeof(age));   // stays near 0-1 s if corrections arrive
 
-  Serial.print("  ");
-  Serial.print(fixName(atoi(quality)));
-  if (nmeaField(line, 7, sats, sizeof(sats)) && sats[0]) {
-    Serial.print("  sats=");
-    Serial.print(sats);
+  char out[96];
+  int n = snprintf(out, sizeof(out), "FIX %s sats=%s age=%ss",
+                   fixName(atoi(quality)),
+                   sats[0] ? sats : "?",
+                   age[0] ? age : "?");
+  if (lastHSigma >= 0.0f && n > 0 && n < (int)sizeof(out)) {
+    snprintf(out + n, sizeof(out) - n, " h+/-%.3fm", lastHSigma);
   }
-  if (nmeaField(line, 13, age, sizeof(age)) && age[0]) {
-    // Age must stay near 0-1 s. If it climbs, corrections are not arriving.
-    Serial.print("  age=");
-    Serial.print(age);
-    Serial.print("s");
+
+  Serial.println(out);
+  if (base.connected()) {
+    base.println(out);
   }
-  Serial.println();
 }
 
 // GST carries precision: lat/lon std deviations (fields 6 and 7), in metres.
@@ -103,9 +108,7 @@ void reportGST(const char* line) {
   if (!nmeaField(line, 7, lonSigma, sizeof(lonSigma))) return;
   if (!latSigma[0] || !lonSigma[0]) return;
   float la = atof(latSigma), lo = atof(lonSigma);
-  Serial.print("    horizontal +/- ");
-  Serial.print(sqrtf(la * la + lo * lo), 3);
-  Serial.println(" m");
+  lastHSigma = sqrtf(la * la + lo * lo);   // reported on the next GGA line
 }
 
 void handleNmeaLine() {

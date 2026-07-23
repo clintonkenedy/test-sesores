@@ -173,6 +173,9 @@ class ClientLink:
     def status(self):
         return "connected" if self.socket else "waiting"
 
+    def poll(self):
+        """A DTU client has no rover telemetry to read back here."""
+
     def close(self):
         if self.socket is not None:
             self.socket.close()
@@ -188,7 +191,8 @@ class ServerLink:
         self.listener.bind((host, port))
         self.listener.listen(8)
         self.listener.setblocking(False)
-        self.clients = {}
+        self.clients = {}       # conn -> address
+        self.inbox = {}         # conn -> partial line buffer of rover telemetry
         print("  listening on {}:{} - waiting for rovers".format(host, port))
 
     def _accept_new(self):
@@ -198,10 +202,41 @@ class ServerLink:
                 return
             conn, address = self.listener.accept()
             _disable_nagle(conn)
-            conn.settimeout(CONNECT_TIMEOUT)
+            conn.setblocking(False)
             self.clients[conn] = address
+            self.inbox[conn] = b""
             print("  rover connected from {}:{}  ({} total)".format(
                 address[0], address[1], len(self.clients)))
+
+    def _drop(self, conn, why):
+        address = self.clients.pop(conn, ("?", 0))
+        self.inbox.pop(conn, None)
+        conn.close()
+        print("  rover {}:{} {}  ({} left)".format(
+            address[0], address[1], why, len(self.clients)))
+
+    def poll(self):
+        """Read anything rovers send back and print it (the fix summary)."""
+        self._accept_new()
+        socks = list(self.clients)
+        if not socks:
+            return
+        readable, _, _ = select.select(socks, [], [], 0)
+        for conn in readable:
+            try:
+                data = conn.recv(512)
+            except OSError:
+                data = b""
+            if not data:
+                self._drop(conn, "gone")
+                continue
+            buffer = self.inbox[conn] + data
+            *lines, self.inbox[conn] = buffer.split(b"\n")
+            host = self.clients[conn][0]
+            for line in lines:
+                text = line.decode("ascii", "replace").strip()
+                if text:
+                    print("  <- {}  {}".format(host, text))
 
     def send(self, payload):
         self._accept_new()
@@ -209,10 +244,7 @@ class ServerLink:
             try:
                 conn.sendall(payload)
             except OSError:
-                address = self.clients.pop(conn)
-                conn.close()
-                print("  rover {}:{} gone  ({} left)".format(
-                    address[0], address[1], len(self.clients)))
+                self._drop(conn, "gone")
         # Corrections with no rover attached are not "lost" - nobody is there
         # yet - so a healthy broadcast is always a success.
         return True
@@ -313,6 +345,8 @@ def main():
         with serial.Serial(args.port, args.baud, timeout=1) as stream:
             for number, frame in read_messages(stream):
                 now = time.monotonic()
+                if link is not None:
+                    link.poll()   # surface anything a rover sent back
 
                 if number is None:
                     dropped["NMEA"] += len(frame)
