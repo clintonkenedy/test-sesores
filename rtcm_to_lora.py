@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""Forward a filtered RTCM3 correction stream from a serial GNSS base to a LoRa DTU.
+"""Forward a filtered RTCM3 correction stream from a serial GNSS base.
 
 Reads the raw stream coming from the base, frames each RTCM3 message, drops the
-ones a rover cannot use, and writes every surviving message to the radio.
+ones a rover cannot use, and delivers every surviving message over the chosen
+link.
 
-Each message is written on its own. The radio caps a single transmission at 240
-bytes and holds only 1000 bytes of receive buffer, so pushing raw byte chunks
-risks silent truncation or overflow. One framed message per write stays inside
-both limits by construction.
+Three link modes:
+  tcp     - client; connects to a LoRa DTU running as TCP Server
+  udp     - client; sends datagrams to a LoRa DTU
+  server  - TCP server; rovers connect in over the LAN (WiFi test)
+
+Each message is delivered on its own. A LoRa DTU caps a single transmission at
+240 bytes and holds only 1000 bytes of receive buffer, so pushing raw byte
+chunks risks silent truncation or overflow. One framed message per write stays
+inside both limits by construction; over the LAN it keeps message boundaries
+clean for the rover.
 
 NMEA sentences are always dropped: they are base telemetry, not corrections.
-
-In TCP mode the DTU must be configured as a TCP *Server*; this script is the
-client that connects to it, and reconnects on its own if the link drops.
 
 Example:
     python rtcm_to_lora.py --list
     python rtcm_to_lora.py --dry-run
-    python rtcm_to_lora.py --host 192.168.1.100 --link-port 8887
+    python rtcm_to_lora.py --mode server          # WiFi LAN test
+    python rtcm_to_lora.py --host 192.168.1.100   # to a DTU (TCP client)
 """
 
 import argparse
+import select
 import socket
 import sys
 import time
@@ -38,10 +44,18 @@ from serial.tools import list_ports
 SERIAL_PORT = "COM3" if sys.platform.startswith("win") else "/dev/cu.usbserial-0001"
 SERIAL_BAUD = 115200
 
-# How to reach the LoRa DTU. "tcp" requires the DTU in TCP Server mode.
-LINK_MODE = "tcp"                       # "tcp" or "udp"
+# How corrections leave this machine.
+#   "tcp"    -> connect out to a DTU in TCP Server mode
+#   "udp"    -> send datagrams to a DTU
+#   "server" -> listen so rovers connect in over the LAN (the WiFi test)
+LINK_MODE = "server"
+
+# Client modes (tcp/udp): where the DTU is.
 DTU_HOST = "192.168.1.100"
-DTU_PORT = 8887
+# Both: the TCP/UDP port. In server mode this is the port rovers connect to.
+LINK_PORT = 8887
+# Server mode: which interface to listen on. 0.0.0.0 = all, so WiFi clients reach it.
+LISTEN_HOST = "0.0.0.0"
 
 # RTCM message numbers never forwarded.
 # 1114 is QZSS: an Asia-Pacific constellation, always empty at this base.
@@ -51,7 +65,7 @@ DROP_MESSAGES = {1114}
 # 1005 carries the base position, and the base does not move.
 THROTTLE_SECONDS = {1005: 10.0}
 
-# Radio limits, from the E90-DTU(900SL30) datasheet.
+# Radio limit, from the E90-DTU(900SL30) datasheet.
 RADIO_MAX_PACKET = 240
 
 # Link behaviour.
@@ -103,13 +117,17 @@ def read_messages(stream):
                 yield None, lead + sentence
 
 
-class RadioLink:
-    """Delivers messages to the DTU, reconnecting on its own when TCP drops."""
+def _disable_nagle(sock):
+    """Small correction messages must go out now, not wait to be coalesced."""
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def __init__(self, mode, host, port, enabled=True):
+
+class ClientLink:
+    """Delivers messages to one DTU, reconnecting on its own when TCP drops."""
+
+    def __init__(self, mode, host, port):
         self.mode = mode
         self.address = (host, port)
-        self.enabled = enabled
         self.socket = None
         self.next_retry = 0.0
 
@@ -119,9 +137,7 @@ class RadioLink:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(CONNECT_TIMEOUT)
         sock.connect(self.address)
-        # Nagle's algorithm would hold small correction messages back to
-        # coalesce them. Freshness matters more than efficiency here.
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _disable_nagle(sock)
         print("  connected to {}:{}".format(*self.address))
         return sock
 
@@ -141,9 +157,6 @@ class RadioLink:
             return False
 
     def send(self, payload):
-        """Return True if the payload was handed to the radio."""
-        if not self.enabled:
-            return True
         if not self._ensure_open():
             return False
         try:
@@ -157,14 +170,74 @@ class RadioLink:
             self.close()
             return False
 
+    def status(self):
+        return "connected" if self.socket else "waiting"
+
     def close(self):
         if self.socket is not None:
             self.socket.close()
             self.socket = None
 
 
-def print_stats(sent, dropped, unsent, elapsed):
-    """Summarise what went out over the radio versus what was filtered away."""
+class ServerLink:
+    """Listens for rover connections and broadcasts each message to all of them."""
+
+    def __init__(self, host, port):
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind((host, port))
+        self.listener.listen(8)
+        self.listener.setblocking(False)
+        self.clients = {}
+        print("  listening on {}:{} - waiting for rovers".format(host, port))
+
+    def _accept_new(self):
+        while True:
+            ready, _, _ = select.select([self.listener], [], [], 0)
+            if not ready:
+                return
+            conn, address = self.listener.accept()
+            _disable_nagle(conn)
+            conn.settimeout(CONNECT_TIMEOUT)
+            self.clients[conn] = address
+            print("  rover connected from {}:{}  ({} total)".format(
+                address[0], address[1], len(self.clients)))
+
+    def send(self, payload):
+        self._accept_new()
+        for conn in list(self.clients):
+            try:
+                conn.sendall(payload)
+            except OSError:
+                address = self.clients.pop(conn)
+                conn.close()
+                print("  rover {}:{} gone  ({} left)".format(
+                    address[0], address[1], len(self.clients)))
+        # Corrections with no rover attached are not "lost" - nobody is there
+        # yet - so a healthy broadcast is always a success.
+        return True
+
+    def status(self):
+        return "{} rover(s)".format(len(self.clients))
+
+    def close(self):
+        for conn in self.clients:
+            conn.close()
+        self.clients.clear()
+        self.listener.close()
+
+
+def make_link(mode, host, listen_host, port, dry_run):
+    """Build the link for the chosen mode, or None for a dry run."""
+    if dry_run:
+        return None
+    if mode == "server":
+        return ServerLink(listen_host, port)
+    return ClientLink(mode, host, port)
+
+
+def print_stats(sent, dropped, unsent, elapsed, link):
+    """Summarise what went out versus what was filtered away."""
     sent_bytes = sum(sent.values())
     dropped_bytes = sum(dropped.values())
     total = sent_bytes + dropped_bytes + unsent
@@ -172,14 +245,15 @@ def print_stats(sent, dropped, unsent, elapsed):
         print("No messages received. Check the serial port, baud rate and wiring.")
         return
 
-    print("\n--- {:.0f} s ---".format(elapsed))
+    where = "  [{}]".format(link.status()) if link is not None else ""
+    print("\n--- {:.0f} s ---{}".format(elapsed, where))
     for label in sorted(sent, key=sent.get, reverse=True):
         print("  SENT     {:<16} {:>7.1f} B/s".format(label, sent[label] / elapsed))
     for label in sorted(dropped, key=dropped.get, reverse=True):
         print("  dropped  {:<16} {:>7.1f} B/s".format(label, dropped[label] / elapsed))
     if unsent:
         print("  LOST     link down       {:>7.1f} B/s".format(unsent / elapsed))
-    print("  -> over the air: {:.1f} B/s of {:.1f} B/s  ({:.0f}% saved)".format(
+    print("  -> forwarded: {:.1f} B/s of {:.1f} B/s  ({:.0f}% saved)".format(
         sent_bytes / elapsed, total / elapsed, 100 * dropped_bytes / total))
 
 
@@ -191,12 +265,13 @@ def main():
                         help="serial device of the base (default: %(default)s)")
     parser.add_argument("--baud", type=int, default=SERIAL_BAUD,
                         help="baud rate (default: %(default)s)")
-    parser.add_argument("--mode", choices=("tcp", "udp"), default=LINK_MODE,
-                        help="how to reach the DTU (default: %(default)s)")
+    parser.add_argument("--mode", choices=("tcp", "udp", "server"), default=LINK_MODE,
+                        help="tcp/udp connect to a DTU, server listens (default: "
+                             "%(default)s)")
     parser.add_argument("--host", default=DTU_HOST,
-                        help="IP address of the LoRa DTU (default: %(default)s)")
-    parser.add_argument("--link-port", type=int, default=DTU_PORT,
-                        help="port the DTU listens on (default: %(default)s)")
+                        help="DTU address for tcp/udp (default: %(default)s)")
+    parser.add_argument("--link-port", type=int, default=LINK_PORT,
+                        help="tcp/udp/listen port (default: %(default)s)")
     parser.add_argument("--drop", type=int, nargs="*", default=sorted(DROP_MESSAGES),
                         metavar="MSG",
                         help="RTCM message numbers to discard (default: %(default)s)")
@@ -213,7 +288,7 @@ def main():
         return
 
     drop = set(args.drop)
-    link = RadioLink(args.mode, args.host, args.link_port, enabled=not args.dry_run)
+    link = make_link(args.mode, args.host, LISTEN_HOST, args.link_port, args.dry_run)
 
     sent = defaultdict(int)
     dropped = defaultdict(int)
@@ -222,6 +297,9 @@ def main():
 
     if args.dry_run:
         print("DRY RUN - nothing will be transmitted.")
+    elif args.mode == "server":
+        print("Serving corrections on port {} (rovers connect in)".format(
+            args.link_port))
     else:
         print("Forwarding over {} to {}:{}".format(
             args.mode.upper(), args.host, args.link_port))
@@ -249,7 +327,7 @@ def main():
                         print("  WARNING: RTCM {} is {} bytes, over the {} byte "
                               "radio limit".format(number, len(frame),
                                                    RADIO_MAX_PACKET))
-                    if link.send(frame):
+                    if link is None or link.send(frame):
                         last_forwarded[number] = now
                         sent["RTCM {}".format(number)] += len(frame)
                     else:
@@ -258,17 +336,18 @@ def main():
                         unsent += len(frame)
 
                 if now >= next_report:
-                    print_stats(sent, dropped, unsent, now - started)
+                    print_stats(sent, dropped, unsent, now - started, link)
                     next_report = now + args.stats_every
 
     except serial.SerialException as error:
         print("Could not open {}: {}".format(args.port, error))
         print("Run with --list to see which ports exist.")
     except KeyboardInterrupt:
-        print_stats(sent, dropped, unsent, time.monotonic() - started)
+        print_stats(sent, dropped, unsent, time.monotonic() - started, link)
         print("\nStopped.")
     finally:
-        link.close()
+        if link is not None:
+            link.close()
 
 
 if __name__ == "__main__":
