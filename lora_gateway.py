@@ -65,6 +65,67 @@ def parse_hostport(text):
     return host, int(port)
 
 
+def log_telemetry_line(log, counters, text):
+    """Timestamp one line from the trucks into the dashboard's log."""
+    counters["telemetry_lines"] += 1
+    source, _, rest = text.partition(" ")
+    if rest and 1 <= len(source) <= 8 and not source.startswith(("$", "{")):
+        payload = rest
+    else:
+        source, payload = "lora", text
+    log.write("{}\t{}\t{}\n".format(
+        datetime.now().isoformat(timespec="seconds"), source, payload))
+    log.flush()
+    if not payload.startswith("$"):
+        print("  [C] <- {}  {}".format(source, payload))
+
+
+class DuplexLink(ClientLink):
+    """One TCP connection doing both jobs: corrections out, telemetry in.
+
+    Field finding (2026-07-24 walk test): the E90's small TCP stack degraded
+    after ~28 min of holding TWO client connections - it silently dropped the
+    corrections socket the rover's fix died with it. A single connection
+    halves the DTU's load, and the RF data it echoes back IS the telemetry,
+    so nothing is lost by reading instead of draining.
+    """
+
+    def __init__(self, host, port, on_line):
+        super().__init__("tcp", host, port)
+        self.on_line = on_line
+        self.buffer = bytearray()
+
+    def poll(self):
+        if self.socket is None:
+            return
+        try:
+            self.socket.setblocking(False)
+            while True:
+                data = self.socket.recv(4096)
+                if not data:
+                    print("  [A] DTU closed the link - reconnecting")
+                    self.close()
+                    return
+                self.buffer.extend(data)
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            self.close()
+            return
+        finally:
+            if self.socket is not None:
+                self.socket.setblocking(True)
+
+        while True:
+            newline = self.buffer.find(b"\n")
+            if newline < 0:
+                break
+            text = bytes(self.buffer[:newline]).decode("ascii", "replace").strip()
+            del self.buffer[:newline + 1]
+            if text:
+                self.on_line(text)
+
+
 # ---------------------------------------------------------------------------
 #  Telemetry side: DTU C -> log + console
 # ---------------------------------------------------------------------------
@@ -97,24 +158,7 @@ def telemetry_listener(stop, dtu, log_path, counters):
                             del buffer[:newline + 1]
                             if not text:
                                 continue
-                            counters["telemetry_lines"] += 1
-                            # Trucks prefix every line with their id
-                            # ("T1 $GNGGA...") so each one gets its own
-                            # identity - and color - on the dashboard.
-                            source, _, rest = text.partition(" ")
-                            if rest and 1 <= len(source) <= 8 and \
-                                    not source.startswith("$"):
-                                payload = rest
-                            else:
-                                source, payload = "lora", text
-                            log.write("{}\t{}\t{}\n".format(
-                                datetime.now().isoformat(timespec="seconds"),
-                                source, payload))
-                            log.flush()
-                            # Raw NMEA goes silently to the log; anything else
-                            # (HELLO, sensor lines) surfaces on the console.
-                            if not payload.startswith("$"):
-                                print("  [C] <- {}  {}".format(source, payload))
+                            log_telemetry_line(log, counters, text)
         except OSError as error:
             print("  [C] telemetry: cannot reach {}:{} - {}".format(
                 host, port, error))
@@ -130,19 +174,32 @@ def run_gateway(args):
     rtcm_optimizer.THROTTLE_SECONDS[1005] = args.rate_1005
 
     host, port = parse_hostport(args.dtu_a)
-    link = ClientLink("tcp", host, port)
-    epoch_filter = EpochFilter(args.level, args.epoch_div)
-
     counters = defaultdict(int)
     stop = threading.Event()
-    threading.Thread(target=telemetry_listener,
-                     args=(stop, args.dtu_c, args.log, counters),
-                     daemon=True).start()
+    single = (args.dtu_a == args.dtu_c)
+
+    if single:
+        # One DTU, ONE connection: telemetry rides back on the same socket.
+        telemetry_log = open(args.log, "a", encoding="utf-8")
+        link = DuplexLink(host, port,
+                          lambda text: log_telemetry_line(
+                              telemetry_log, counters, text))
+    else:
+        link = ClientLink("tcp", host, port)
+        threading.Thread(target=telemetry_listener,
+                         args=(stop, args.dtu_c, args.log, counters),
+                         daemon=True).start()
+
+    epoch_filter = EpochFilter(args.level, args.epoch_div)
 
     print("LoRa gateway")
     print("  corrections: {} -> optimizer L{} div{} -> DTU A {}".format(
         args.port, args.level, args.epoch_div, args.dtu_a))
-    print("  telemetry:   DTU C {} -> {}".format(args.dtu_c, args.log))
+    if single:
+        print("  telemetry:   same connection (single-DTU duplex) -> {}".format(
+            args.log))
+    else:
+        print("  telemetry:   DTU C {} -> {}".format(args.dtu_c, args.log))
     print("  1005 repeated every {:.0f} s (broadcast join time)\n".format(
         args.rate_1005))
 
