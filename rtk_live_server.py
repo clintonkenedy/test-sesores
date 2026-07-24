@@ -88,6 +88,26 @@ class SessionStore:
                 "hsig": self.last_hsig.get(ip),
             })
 
+    def add_json(self, stamp, source, obj):
+        """Truck telemetry in SmartMine JSON: c=id, a=lat, o=lon, f=fix, s=sats."""
+        try:
+            lat = float(obj.get("a") or 0.0)
+            lon = float(obj.get("o") or 0.0)
+        except (TypeError, ValueError):
+            return
+        if lat == 0.0 and lon == 0.0:
+            return                    # no position yet
+        with self.lock:
+            self.points.append({
+                "seq": len(self.points) + 1,
+                "t": stamp, "ip": "CAM{}".format(obj.get("c", source)),
+                "lat": round(lat, 8), "lon": round(lon, 8),
+                "alt": None,
+                "q": int(obj.get("f", 0) or 0),
+                "sats": int(obj.get("s", 0) or 0),
+                "age": None, "hsig": None,
+            })
+
     def add_gst(self, ip, fields):
         try:
             self.last_hsig[ip] = round(
@@ -150,9 +170,18 @@ def tail_log(path, store, stop):
                 position = handle.tell()
             for raw in chunk.splitlines():
                 parts = raw.split("\t", 2)
-                if len(parts) != 3 or not parts[2].startswith("$"):
+                if len(parts) != 3:
                     continue
                 stamp, ip, text = parts
+                if text.startswith("{"):
+                    # SmartMine truck telemetry (JSON over LoRa)
+                    try:
+                        store.add_json(stamp, ip, json.loads(text))
+                    except ValueError:
+                        pass
+                    continue
+                if not text.startswith("$"):
+                    continue
                 fields = text[1:].split("*", 1)[0].split(",")
                 kind = fields[0]
                 if kind.endswith("GST") and len(fields) >= 9:
