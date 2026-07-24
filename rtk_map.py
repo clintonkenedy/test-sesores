@@ -420,7 +420,7 @@ def svg_scatter(samples, stats):
 REPORT_TEMPLATE = r"""<!doctype html>
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Reporte de precisión RTK</title>
+<title>Reporte de precisión RTK</title>__REFRESH__
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
 :root{color-scheme:light;
@@ -585,7 +585,7 @@ def ortho_url(tiles_dir):
     return ""
 
 
-def build_report(samples, metrics, out_path, tiles_dir=TILES_DIR):
+def build_report(samples, metrics, out_path, tiles_dir=TILES_DIR, refresh=None):
     m = metrics
     span = m["t_end"] - m["t_start"]
     pct = {q: 100.0 * c / m["total"] for q, c in m["counts"].items()}
@@ -595,6 +595,11 @@ def build_report(samples, metrics, out_path, tiles_dir=TILES_DIR):
     subtitle = "{} · {} puntos en {:.1f} min · {:.7f}, {:.7f}".format(
         datetime.fromtimestamp(m["t_start"]).strftime("%Y-%m-%d %H:%M"),
         m["total"], span / 60, m["all"]["lat0"], m["all"]["lon0"])
+    if refresh:
+        subtitle = ("🔴 EN VIVO · se actualiza cada {} s · último dato {} · "
+                    .format(refresh,
+                            datetime.fromtimestamp(m["t_end"]).strftime("%H:%M:%S"))
+                    + subtitle)
 
     tiles = []
     for label, value, unit in [
@@ -630,7 +635,10 @@ def build_report(samples, metrics, out_path, tiles_dir=TILES_DIR):
         m["total"], span / 60, pct.get(4, 0.0), headline["cep95"] * 100,
         headline["rms"] * 100, m["all"]["lat0"], m["all"]["lon0"])
 
+    refresh_tag = ('<meta http-equiv="refresh" content="{}">'.format(refresh)
+                   if refresh else "")
     html = (REPORT_TEMPLATE
+            .replace("__REFRESH__", refresh_tag)
             .replace("__SUBTITLE__", subtitle)
             .replace("__TILES__", "".join(tiles))
             .replace("__SCATTER__", svg_scatter(samples, m["all"]))
@@ -686,12 +694,39 @@ def main():
                              "(standalone rover; no serial connection needed)")
     parser.add_argument("--rover-ip", default=None,
                         help="with --nmea-log: keep only this rover's lines")
+    parser.add_argument("--live", type=float, default=None, metavar="SECONDS",
+                        help="with --nmea-log: rebuild the report every N seconds "
+                             "and make the page auto-reload (live view)")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
     if args.list:
         show_ports()
         return
+
+    # Live mode: re-read the growing log and rewrite the page on a loop; the
+    # page reloads itself, so the browser shows the session as it happens.
+    if args.live and args.nmea_log:
+        out = args.out if args.out != REPORT_FILE else "rtk_live.html"
+        print("Live view -> {}  (open it in the browser; Ctrl+C stops)".format(out))
+        try:
+            while True:
+                try:
+                    samples = parse_telemetry_log(args.nmea_log, args.rover_ip)
+                except OSError as error:
+                    print("Could not read {}: {}".format(args.nmea_log, error))
+                    return
+                if len(samples) >= 10:
+                    build_report(samples, build_metrics(samples), out,
+                                 args.tiles, refresh=max(2, int(args.live)))
+                    print("  {}  {} pts".format(
+                        datetime.now().strftime("%H:%M:%S"), len(samples)))
+                else:
+                    print("  waiting for data... ({} pts)".format(len(samples)))
+                time.sleep(args.live)
+        except KeyboardInterrupt:
+            print("\nLive view stopped.")
+            return
 
     if args.nmea_log:
         try:
