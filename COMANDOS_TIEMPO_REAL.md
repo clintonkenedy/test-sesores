@@ -8,12 +8,16 @@ el camión, dashboard en vivo. (El banco WiFi anterior quedó en `COMANDOS.md`.)
 ## Arquitectura
 
 ```
-LC29H-BS ──UART──► ESP32 base ──USB──► PC ──TCP──► E90-A ~~915.125 MHz~~ E22 ──RS485──► C6 ──UART──► LC29H-DA
- (base fija)     (base_gps_esp32)      │   x2                                            (camión T1..T5)
+LC29H-BS ──UART──► ESP32 base ──USB──► PC ──TCP──► E90-A ~~915.125 MHz~~ E22 ──UART──► C6 ──UART──► LC29H-DA
+ (base fija)     (base_gps_esp32)      │   x2                            (GPIO21/20)  (camión T1..T5)
                                        │◄── telemetría "T1 $GNGGA..." ◄~~RF~~ (turno TDMA del camión)
                                        ▼
                           rover_telemetry.log ──► dashboard :8765
 ```
+
+Firmware del camión: el nodo CAM00x propio (JSON) o **`rover_lora_c6/`**.
+Cableado validado en PCB: `E22 TXD → GPIO20` · `E22 RXD → GPIO21` ·
+`M0,M1 → GND` · `E22 VCC → 5V` · LC29H en GPIO18/19 · GND común.
 
 - **Una sola radio en la base (E90-A)**: transmite y recibe. El TDMA separa en
   tiempo: corrección (~150 ms) → turnos T1..T5 → aire libre → repite cada 2 s.
