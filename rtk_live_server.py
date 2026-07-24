@@ -196,6 +196,8 @@ button{flex:1;background:var(--surface);color:var(--ink);
 button:hover{border-color:var(--muted)}
 button.on{border-color:var(--good);color:var(--good)}
 .foot{margin-top:8px;color:var(--muted);font-size:11px}
+#cloud{width:100%;border:1px solid var(--border);border-radius:8px;
+  background:var(--surface)}
 </style></head><body>
 <div id="map"></div>
 <div class="panel">
@@ -209,6 +211,10 @@ button.on{border-color:var(--good);color:var(--good)}
     <div><span class="k">%Fixed</span><span class="v" id="pf">—</span></div>
     <div><span class="k">CEP95</span><span class="v" id="cep">—</span></div>
     <div><span class="k">RMS</span><span class="v" id="rms">—</span></div>
+  </div>
+  <div class="cloudbox">
+    <div class="k" style="margin:10px 0 4px">Nube de puntos (en vivo)</div>
+    <canvas id="cloud" width="244" height="244"></canvas>
   </div>
   <div class="rovers" id="rovers"></div>
   <div class="btns">
@@ -236,10 +242,52 @@ if(HAS_TILES){
     {minZoom:TMIN,maxZoom:22,maxNativeZoom:TMAX}).addTo(map);
   overlays["Ortofoto"]=ortho;
 }
-L.control.layers(bases,overlays).addTo(map);
+// Top-left, so it never hides under the stats panel on the right.
+L.control.layers(bases,overlays,{position:"topleft"}).addTo(map);
 
 var seq=0, first=true, follow=true;
 var tracks={}, dots=L.layerGroup().addTo(map), roverIdx={};
+var pts=[];   // every sample, for the live point-cloud panel
+
+// Zoomed-in scatter: centimetre-scale view of the dispersion that is
+// invisible on the map (a good antenna keeps all dots in one pixel there).
+function drawCloud(){
+  var c=document.getElementById("cloud"), ctx=c.getContext("2d");
+  var W=c.width, H=c.height;
+  ctx.clearRect(0,0,W,H);
+  if(pts.length<3) return;
+  var fix=pts.filter(function(p){return p.q==4;});
+  var ref=fix.length>=10?fix:pts;
+  var la0=0, lo0=0;
+  ref.forEach(function(p){la0+=p.lat; lo0+=p.lon;});
+  la0/=ref.length; lo0/=ref.length;
+  var mLat=111132.95, mLon=111319.49*Math.cos(la0*Math.PI/180);
+  var rs=ref.map(function(p){
+    return Math.hypot((p.lon-lo0)*mLon,(p.lat-la0)*mLat);}).sort(
+    function(a,b){return a-b;});
+  var span=Math.max((rs[Math.floor(rs.length*0.95)]||0)*1.7, 0.02);
+  var s=(W/2-12)/span;
+  var rms=Math.sqrt(rs.reduce(function(a,r){return a+r*r;},0)/rs.length);
+  var sig=rms/Math.SQRT2;
+  ctx.setLineDash([4,4]); ctx.strokeStyle="rgba(137,135,129,.7)";
+  [1,2].forEach(function(k){
+    ctx.beginPath(); ctx.arc(W/2,H/2,sig*k*s,0,7); ctx.stroke();});
+  ctx.setLineDash([]);
+  var start=Math.max(0,pts.length-5000);
+  ctx.globalAlpha=.75;
+  for(var i=start;i<pts.length;i++){
+    var p=pts[i];
+    ctx.fillStyle=FIXCOLOR[p.q]||"#898781";
+    ctx.beginPath();
+    ctx.arc(W/2+(p.lon-lo0)*mLon*s, H/2-(p.lat-la0)*mLat*s, 2, 0, 7);
+    ctx.fill();
+  }
+  ctx.globalAlpha=1;
+  ctx.fillStyle="#898781"; ctx.font="10px system-ui";
+  ctx.fillText("radio ±"+(span<1?(span*100).toFixed(1)+" cm"
+                              :span.toFixed(2)+" m"), 6, H-8);
+  ctx.fillText("anillos 1σ · 2σ", 6, 14);
+}
 
 function roverColor(ip){
   if(!(ip in roverIdx)) roverIdx[ip]=Object.keys(roverIdx).length;
@@ -270,10 +318,12 @@ function poll(){
   .then(function(d){
     d.points.forEach(function(p){
       seq=p.seq;
+      pts.push(p);
       L.circleMarker([p.lat,p.lon],{radius:3,stroke:false,fillOpacity:.75,
         fillColor:FIXCOLOR[p.q]||"#898781"}).addTo(dots);
       track(p.ip).addLatLng([p.lat,p.lon]);
     });
+    if(d.points.length) drawCloud();
     var last=d.points[d.points.length-1];
     if(last){
       var f=document.getElementById("fix");
