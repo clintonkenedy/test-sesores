@@ -1,0 +1,31 @@
+# Python bytecode - regenerated automatically, never versioned
+__pycache__/
+*.py[cod]
+
+# Session data - measurements belong to each bench run, not to the code.
+# To keep a specific report as evidence: git add -f reporte_xxx.html
+rover_telemetry.log
+telemetria_*.log
+*.log
+rtk_points.csv
+rtk_report.html
+rtk_live.html
+reporte_*.html
+
+# Virtual environments
+venv/
+.venv/
+gnss-env/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+
+# Editor state
+.vscode/
+.idea/
