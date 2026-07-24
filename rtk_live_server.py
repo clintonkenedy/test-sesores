@@ -64,6 +64,12 @@ class SessionStore:
         self.lock = threading.Lock()
         self.points = []          # dicts with seq/ip/lat/lon/q/sats/age/hsig/t
         self.last_hsig = {}       # per rover ip
+        self.start = 0            # session cut: stats ignore points before it
+
+    def reset(self):
+        """Start a fresh measuring session (e.g. when switching filter level)."""
+        with self.lock:
+            self.start = len(self.points)
 
     def add_gga(self, stamp, ip, fields):
         lat = dm_to_degrees(fields[2], fields[3])
@@ -96,7 +102,7 @@ class SessionStore:
 
     def _stats(self):
         """Session statistics; scatter metrics over the FIXED subset."""
-        pts = self.points
+        pts = self.points[self.start:]
         if not pts:
             return {}
         fixed = [p for p in pts if p["q"] == 4]
@@ -220,6 +226,8 @@ button.on{border-color:var(--good);color:var(--good)}
   <div class="btns">
     <button id="follow" class="on">Seguir</button>
     <button id="fit">⟲ Encuadrar</button>
+    <button id="reset" title="Reinicia métricas, nube y mapa desde ahora">
+      ▶ Sesión</button>
   </div>
   <div class="foot" id="status">conectando…</div>
 </div>
@@ -308,6 +316,18 @@ function fitAll(){
 document.getElementById("fit").onclick=fitAll;
 document.getElementById("follow").onclick=function(){
   follow=!follow; this.classList.toggle("on",follow);};
+
+// New measuring session: server forgets old points for the stats, and the
+// map/cloud start clean. The log file itself is never touched.
+var t0=Date.now();
+document.getElementById("reset").onclick=function(){
+  fetch("/reset").then(function(){
+    pts=[]; dots.clearLayers();
+    Object.values(tracks).forEach(function(t){t.setLatLngs([]);});
+    t0=Date.now();
+    drawCloud();
+  });
+};
 map.on("dragstart",function(){follow=false;
   document.getElementById("follow").classList.remove("on");});
 
@@ -349,7 +369,10 @@ function poll(){
         (FIXNAME[p.q]||"?")+' · '+p.sats+' sats</span>';
       box.appendChild(row);
     });
-    put("status","último dato "+(last?last.t.slice(11):"—"));
+    var el=Math.floor((Date.now()-t0)/1000);
+    put("status","último dato "+(last?last.t.slice(11):"—")+
+        "  ·  sesión "+String(Math.floor(el/60)).padStart(2,"0")+":"+
+        String(el%60).padStart(2,"0"));
     put("clock","● "+new Date().toLocaleTimeString());
   })
   .catch(function(){put("status","sin conexión con el servidor…");});
@@ -391,6 +414,10 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"points": fresh, "stats": stats,
                                "rovers": rovers}).encode("utf-8")
             self._send(200, "application/json", body)
+
+        elif parsed.path == "/reset":
+            self.store.reset()
+            self._send(200, "application/json", b'{"ok": true}')
 
         elif parsed.path.startswith("/tiles/") and self.tiles_dir:
             # /tiles/z/x/y.png -> guard against path escapes, then serve.
