@@ -227,7 +227,27 @@ class ClientLink:
         return "connected" if self.socket else "waiting"
 
     def poll(self):
-        """A DTU client has no rover telemetry to read back here."""
+        """Drain whatever the DTU pushes back on this socket.
+
+        A transceiver DTU copies everything it hears over RF to every TCP
+        client - including this corrections-only connection. Discarding it
+        keeps the OS buffer from slowly filling when one DTU plays both
+        roles (the telemetry listener reads its own copy on its own socket).
+        """
+        if self.socket is None or self.mode == "udp":
+            return
+        try:
+            self.socket.setblocking(False)
+            while self.socket.recv(4096):
+                pass
+            self.close()          # recv returned b'': the DTU closed on us
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            self.close()
+        finally:
+            if self.socket is not None:
+                self.socket.setblocking(True)
 
     def close(self):
         if self.socket is not None:
