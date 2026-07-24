@@ -105,6 +105,24 @@ def crc24q(data):
     return crc & 0xFFFFFF
 
 
+def open_serial(port, baud, timeout=1):
+    """Open the port WITHOUT pulsing DTR/RTS.
+
+    The default open toggles those lines, which resets the ESP32 - and if
+    opens come in quick succession, the pulse can trap it in its ROM
+    bootloader: port open, board alive, zero data. Deasserting both before
+    opening means the bridge never even notices the connection.
+    """
+    stream = serial.Serial()
+    stream.port = port
+    stream.baudrate = baud
+    stream.timeout = timeout
+    stream.dtr = False
+    stream.rts = False
+    stream.open()
+    return stream
+
+
 def show_ports():
     """List visible serial ports so the base's adapter can be identified."""
     ports = sorted(list_ports.comports())
@@ -121,6 +139,9 @@ def read_messages(stream):
     while True:
         lead = stream.read(1)
         if not lead:
+            # Idle heartbeat: lets the caller notice a silent serial port
+            # instead of blocking forever with no output at all.
+            yield -2, b""
             continue
 
         if lead[0] == RTCM_PREAMBLE:
@@ -225,6 +246,11 @@ class ServerLink:
         self.listener.setblocking(False)
         self.clients = {}       # conn -> address
         self.inbox = {}         # conn -> partial line buffer of rover telemetry
+        # Frames replayed to every NEW client on connect. A rover cannot use
+        # any correction until it has the base position (1005); when 1005 is
+        # throttled, a late joiner would otherwise sit blind for up to the
+        # whole throttle period before starting to converge.
+        self.welcome = {}       # message number -> latest frame
         self.log = open(TELEMETRY_LOG, "a", encoding="utf-8")
         print("  listening on {}:{} - waiting for rovers".format(host, port))
         print("  rover telemetry -> {}".format(TELEMETRY_LOG))
@@ -241,6 +267,12 @@ class ServerLink:
             self.inbox[conn] = b""
             print("  rover connected from {}:{}  ({} total)".format(
                 address[0], address[1], len(self.clients)))
+            for frame in self.welcome.values():
+                try:
+                    conn.sendall(frame)   # instant 1005: converge now, not in 10 s
+                except OSError:
+                    self._drop(conn, "gone")
+                    break
 
     def _drop(self, conn, why):
         address = self.clients.pop(conn, ("?", 0))
@@ -393,7 +425,7 @@ def main():
         total = 0
         lost = 0
         try:
-            with serial.Serial(args.port, args.baud, timeout=1) as stream:
+            with open_serial(args.port, args.baud) as stream:
                 while True:
                     if link is not None:
                         link.poll()
@@ -422,11 +454,18 @@ def main():
         return
 
     try:
-        with serial.Serial(args.port, args.baud, timeout=1) as stream:
+        with open_serial(args.port, args.baud) as stream:
             for number, frame in read_messages(stream):
                 now = time.monotonic()
                 if link is not None:
                     link.poll()   # surface anything a rover sent back
+
+                if number == -2:              # idle: no serial data this second
+                    if now >= next_report:
+                        print("  ... no data from {} for a while - check the "
+                              "base ESP32 / USB".format(args.port))
+                        next_report = now + args.stats_every
+                    continue
 
                 if number is None:
                     dropped["NMEA"] += len(frame)

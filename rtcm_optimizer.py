@@ -33,8 +33,8 @@ from collections import defaultdict
 
 import serial
 
-from rtcm_to_lora import (LISTEN_HOST, crc24q, make_link, print_stats,
-                          read_messages, show_ports)
+from rtcm_to_lora import (LISTEN_HOST, crc24q, make_link, open_serial,
+                          print_stats, read_messages, show_ports)
 
 # ===========================================================================
 #  CONFIGURATION - edit here, or override on the command line.
@@ -186,12 +186,18 @@ def main():
     next_report = started + args.stats_every
 
     try:
-        with serial.Serial(args.port, args.baud, timeout=1) as stream:
+        with open_serial(args.port, args.baud) as stream:
             for number, frame in read_messages(stream):
                 now = time.monotonic()
                 if link is not None:
                     link.poll()
 
+                if number == -2:              # idle: no serial data this second
+                    if now >= next_report:
+                        print("  ... no data from {} for a while - check the "
+                              "base ESP32 / USB".format(args.port))
+                        next_report = now + args.stats_every
+                    continue
                 if number is None:
                     dropped["NMEA"] += len(frame)
                     continue
@@ -207,6 +213,10 @@ def main():
                         sent[label] += len(out_frame)
                     else:
                         unsent += len(out_frame)
+                # Keep the latest throttled frames for instant replay to any
+                # rover that connects mid-cycle (cuts startup by up to 10 s).
+                if number in THROTTLE_SECONDS and hasattr(link, "welcome"):
+                    link.welcome[number] = frame
 
                 if now >= next_report:
                     print_stats(sent, dropped, unsent, now - started, link)

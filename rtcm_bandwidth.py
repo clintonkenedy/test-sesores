@@ -62,7 +62,13 @@ def show_ports():
 def read_frames(port, baudrate, duration):
     """Yield (label, frame_size_bytes) for each message seen within duration."""
     deadline = time.monotonic() + duration
-    with serial.Serial(port, baudrate, timeout=1) as stream:
+    # Open without pulsing DTR/RTS: pulses reset the ESP32 and can trap it
+    # in its bootloader (port open, zero data).
+    stream = serial.Serial()
+    stream.port, stream.baudrate, stream.timeout = port, baudrate, 1
+    stream.dtr = stream.rts = False
+    stream.open()
+    with stream:
         while time.monotonic() < deadline:
             lead = stream.read(1)
             if not lead:

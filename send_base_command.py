@@ -38,7 +38,12 @@ def nmea_sentence(body):
 
 def send_and_listen(port, baud, bodies):
     """Send each sentence, then print every $P... reply for a few seconds."""
-    with serial.Serial(port, baud, timeout=0.5) as link:
+    # No DTR/RTS pulse: do not reset the base ESP32 just by opening.
+    link = serial.Serial()
+    link.port, link.baudrate, link.timeout = port, baud, 0.5
+    link.dtr = link.rts = False
+    link.open()
+    with link:
         for body in bodies:
             sentence = nmea_sentence(body)
             print("-> {}".format(sentence.decode("ascii").strip()))
