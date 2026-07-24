@@ -45,7 +45,7 @@
 // ── Secuencia de re-survey al iniciar ────────────────────────────────────────
 // 1 = al arrancar ordena survey-in nuevo (usar al instalar/mover la base)
 // 0 = arranca pasivo, el receptor conserva su configuración (producción)
-#define RESURVEY_ON_BOOT       1
+#define RESURVEY_ON_BOOT       0
 #define RESURVEY_SAVE          1     // guardar el modo survey-in en flash del GPS
 #define RESURVEY_RESTART_GPS   1     // reiniciar el receptor para aplicar ya
 #define SURVEY_SECONDS       120     // duración del survey-in

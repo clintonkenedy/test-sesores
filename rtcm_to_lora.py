@@ -31,6 +31,7 @@ import socket
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime
 
 import serial
 from serial.tools import list_ports
@@ -58,12 +59,20 @@ LINK_PORT = 8887
 LISTEN_HOST = "0.0.0.0"
 
 # RTCM message numbers never forwarded.
-# 1114 is QZSS: an Asia-Pacific constellation, always empty at this base.
-DROP_MESSAGES = {1114}
+#
+# HARD-WON LESSON - do NOT add 1114 here. It looks like dead weight (QZSS,
+# always empty at this base), but it carries DF393=0: the "epoch complete"
+# marker closing the MSM chain 1074->1084->1094->1124->1114. Dropping it left
+# the rover waiting forever for the end of every epoch, so it applied NO
+# corrections at all (fix stuck in SINGLE, GGA age empty). Removing an MSM
+# message requires rewriting DF393 in the previous one and recomputing its
+# CRC - not worth 28 B/s.
+DROP_MESSAGES = set()
 
 # Minimum seconds between forwards of a given message.
-# 1005 carries the base position, and the base does not move.
-THROTTLE_SECONDS = {1005: 10.0}
+# Left empty: the LC29H-BS/DA pair expects its native 1 Hz cadence, and after
+# the DF393 incident the burden of proof is on any throttling, not against it.
+THROTTLE_SECONDS = {}
 
 # Radio limit, from the E90-DTU(900SL30) datasheet.
 RADIO_MAX_PACKET = 240
@@ -72,6 +81,10 @@ RADIO_MAX_PACKET = 240
 CONNECT_TIMEOUT = 5.0
 RECONNECT_DELAY = 3.0
 STATS_EVERY = 10.0
+
+# Server mode: every line a rover sends back (raw GGA/GST, HELLO, FIX) lands
+# here, timestamped. rtk_map.py --nmea-log builds precision reports from it.
+TELEMETRY_LOG = "rover_telemetry.log"
 
 # ===========================================================================
 
@@ -212,7 +225,9 @@ class ServerLink:
         self.listener.setblocking(False)
         self.clients = {}       # conn -> address
         self.inbox = {}         # conn -> partial line buffer of rover telemetry
+        self.log = open(TELEMETRY_LOG, "a", encoding="utf-8")
         print("  listening on {}:{} - waiting for rovers".format(host, port))
+        print("  rover telemetry -> {}".format(TELEMETRY_LOG))
 
     def _accept_new(self):
         while True:
@@ -254,8 +269,15 @@ class ServerLink:
             host = self.clients[conn][0]
             for line in lines:
                 text = line.decode("ascii", "replace").strip()
-                if text:
+                if not text:
+                    continue
+                self.log.write("{}\t{}\t{}\n".format(
+                    datetime.now().isoformat(timespec="seconds"), host, text))
+                # Raw $GxGGA/$GxGST go silently to the log (1/s per rover would
+                # bury the console); summaries and HELLOs stay visible.
+                if not text.startswith("$"):
                     print("  <- {}  {}".format(host, text))
+            self.log.flush()
 
     def send(self, payload):
         self._accept_new()
@@ -276,6 +298,7 @@ class ServerLink:
             conn.close()
         self.clients.clear()
         self.listener.close()
+        self.log.close()
 
 
 def make_link(mode, host, listen_host, port, dry_run):

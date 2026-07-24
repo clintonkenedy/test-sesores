@@ -79,6 +79,9 @@ def main():
                         help="query the current survey-in configuration")
     parser.add_argument("--survey", nargs=2, metavar=("SECONDS", "ACC_M"),
                         help="switch to survey-in mode, e.g. --survey 120 30")
+    parser.add_argument("--fixed", nargs=3, metavar=("ECEF_X", "ECEF_Y", "ECEF_Z"),
+                        help="pin the base to these ECEF coordinates (mode 2); "
+                             "take them from check_base_position.py")
     parser.add_argument("--save", action="store_true",
                         help="persist the configuration to flash (PQTMSAVEPAR)")
     parser.add_argument("--restart", action="store_true",
@@ -94,6 +97,11 @@ def main():
         duration, accuracy = args.survey
         # Mode 1 = survey-in. ECEF X/Y/Z are only used by fixed mode (2).
         bodies.append("PQTMCFGSVIN,W,1,{},{},0,0,0".format(duration, accuracy))
+    if args.fixed:
+        x, y, z = args.fixed
+        # Mode 2 = fixed: the base broadcasts exactly these coordinates forever,
+        # so power cycles no longer shift the position (and no survey blackout).
+        bodies.append("PQTMCFGSVIN,W,2,0,0,{},{},{}".format(x, y, z))
     if args.save:
         bodies.append("PQTMSAVEPAR")
     if args.restart:

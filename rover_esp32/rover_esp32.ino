@@ -129,8 +129,15 @@ void handleNmeaLine() {
   // Log every sentence raw so it is obvious the LC29H is being heard.
   Serial.print("[gnss ] ");
   Serial.println(nmeaLine);
-  if (strstr(nmeaLine, "GGA")) reportGGA(nmeaLine);
-  else if (strstr(nmeaLine, "GST")) reportGST(nmeaLine);
+  if (strstr(nmeaLine, "GGA")) {
+    // Raw sentence to the base: the server logs it with position included,
+    // so precision sessions run with the rover fully standalone outdoors.
+    if (base.connected()) base.println(nmeaLine);
+    reportGGA(nmeaLine);
+  } else if (strstr(nmeaLine, "GST")) {
+    if (base.connected()) base.println(nmeaLine);
+    reportGST(nmeaLine);
+  }
   nmeaLen = 0;
 }
 
